@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Cyber-Agent specific
+knowledge_db/
+knowledge_base/raw/
+knowledge_base/0*
+exports/*.json
+logs/*.log
+logs/*.bak
+.install_state
+
+# System
+.DS_Store
+.idea/
+.vscode/
+temp/
+/tmp/

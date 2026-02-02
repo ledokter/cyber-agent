@@ -1,0 +1,758 @@
+#!/usr/bin/env python3
+"""
+Cyber-Agent Complete v2.1 - CORRIGÉ
+Agent de cybersécurité 100% offline - Ollama + BlackArch
+Tout-en-un : OSINT, Pentest, Forensics, Hardening
+"""
+
+import json
+import subprocess
+import os
+import sys
+import re
+import requests
+from datetime import datetime
+from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+
+# Imports LangChain
+try:
+    from langchain_ollama import ChatOllama
+    from langchain_core.messages import HumanMessage, SystemMessage
+except ImportError:
+    print("[-] Erreur: langchain non installé")
+    print("[-] Exécutez: pip install langchain langchain-ollama")
+    sys.exit(1)
+
+# Couleurs terminal
+class Colors:
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    MAGENTA = '\033[95m'
+    BLUE = '\033[94m'
+    END = '\033[0m'
+
+@dataclass
+class MissionContext:
+    target: str
+    mission_type: str
+    start_time: datetime = field(default_factory=datetime.now)
+    findings: List[Dict] = field(default_factory=list)
+    tools_used: List[str] = field(default_factory=list)
+
+class SecurityAgent:
+    def __init__(self, model_name: str = "qwen2.5:14b", device_type: str = "generic"):
+        self.device_type = device_type
+        self.model_name = model_name
+        
+        # Optimisation selon hardware
+        num_threads = 6 if device_type == "thinkpad20kh" else 4
+        
+        self.llm = ChatOllama(
+            model=model_name,
+            base_url="http://localhost:11434",
+            temperature=0.1,
+            num_ctx=32768,
+            num_thread=num_threads,
+            keep_alive="30m"
+        )
+        
+        self.missions: List[MissionContext] = []
+        self.current_mission: Optional[MissionContext] = None
+        
+        print(f"{Colors.GREEN}[+]{Colors.END} Agent initialisé ({device_type}, {num_threads} threads)")
+
+    def safe_execute(self, command: str, timeout: int = 300, sandbox: bool = True) -> Dict:
+        """
+        Exécute une commande système avec sécurité
+        """
+        # Liste noire commandes dangereuses
+        dangerous = ['rm -rf /', ':(){ :|:& };:', '> /dev/sda', 'mkfs.', 'dd if=/dev/zero']
+        for d in dangerous:
+            if d in command:
+                return {"error": "Commande dangereuse bloquée par sécurité", "command": command}
+        
+        # Sandbox avec firejail
+        if sandbox and not command.startswith("firejail"):
+            cmd_exec = f"firejail --net=none --private-tmp --timeout=00:05:00 {command}"
+        else:
+            cmd_exec = command
+        
+        try:
+            result = subprocess.run(
+                cmd_exec, 
+                shell=True, 
+                capture_output=True, 
+                text=True, 
+                timeout=timeout
+            )
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "returncode": result.returncode,
+                "command": cmd_exec
+            }
+        except subprocess.TimeoutExpired:
+            return {"error": "Timeout - commande trop longue", "command": command}
+        except Exception as e:
+            return {"error": str(e), "command": command}
+
+    # =========================================================================
+    # OSINT MODULE
+    # =========================================================================
+    def osint_domain(self, domain: str, deep: bool = False) -> Dict:
+        """
+        Reconnaissance passive complète d'un domaine
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} OSINT Reconnaissance: {domain}")
+        
+        data = {
+            "domain": domain,
+            "timestamp": datetime.now().isoformat(),
+            "subdomains": [],
+            "emails": [],
+            "ips": [],
+            "hosts": [],
+            "technologies": []
+        }
+        
+        # 1. Subfinder (sous-domaines)
+        try:
+            result = subprocess.run(
+                f"subfinder -d {domain} -silent -all", 
+                shell=True, capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0:
+                data["subdomains"] = list(set(filter(None, result.stdout.strip().split('\n'))))
+                print(f"{Colors.GREEN}[+]{Colors.END} {len(data['subdomains'])} sous-domaines trouvés")
+        except Exception as e:
+            print(f"{Colors.YELLOW}[!]{Colors.END} Subfinder: {e}")
+        
+        # 2. TheHarvester (emails + hosts)
+        try:
+            output_file = f"/tmp/th_{domain.replace('.', '_')}"
+            subprocess.run(
+                f"theHarvester -d {domain} -b all -f {output_file}",
+                shell=True, timeout=120
+            )
+            xml_file = f"{output_file}.xml"
+            if os.path.exists(xml_file):
+                with open(xml_file, 'r', errors='ignore') as f:
+                    content = f.read()
+                    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', content)
+                    data["emails"] = list(set(emails))
+                    ips = re.findall(r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b', content)
+                    data["ips"] = list(set(ips))
+                print(f"{Colors.GREEN}[+]{Colors.END} {len(data['emails'])} emails, {len(data['ips'])} IPs")
+        except Exception as e:
+            print(f"{Colors.YELLOW}[!]{Colors.END} theHarvester: {e}")
+        
+        # 3. Wayback Machine (URLs historiques)
+        try:
+            url = f"http://web.archive.org/cdx/search/cdx?url=*.{domain}/*&output=json&collapse=urlkey&limit=1000"
+            response = requests.get(url, timeout=30)
+            if response.status_code == 200:
+                wayback_data = response.json()
+                interesting = []
+                for entry in wayback_data[1:]:  # Skip header
+                    if len(entry) > 2:
+                        url_found = entry[2]
+                        if any(x in url_found.lower() for x in ['admin', 'api', 'backup', '.sql', '.env', 'config', 'internal']):
+                            interesting.append(url_found)
+                data["wayback_urls"] = list(set(interesting))[:50]
+                print(f"{Colors.GREEN}[+]{Colors.END} {len(data['wayback_urls'])} URLs sensibles dans Wayback")
+        except Exception as e:
+            print(f"{Colors.YELLOW}[!]{Colors.END} Wayback: {e}")
+        
+        # 4. Analyse IA
+        if data["subdomains"] or data["emails"]:
+            analysis_prompt = f"""Analyse OSINT pour {domain}:
+- {len(data['subdomains'])} sous-domaines dont: {', '.join(data['subdomains'][:5])}
+- {len(data['emails'])} emails collectés
+- {len(data.get('wayback_urls', []))} URLs historiques sensibles
+
+Identifie:
+1. Le sous-domaine le plus critique (dev/staging/admin ?)
+2. Schéma de nommage emails (prenom.nom ?)
+3. Fuites potentielles à investiguer
+4. Recommandations prioritaires"""
+
+            try:
+                analysis = self.llm.invoke(analysis_prompt)
+                data["analysis"] = analysis.content
+                print(f"\n{Colors.CYAN}=== ANALYSE IA ==={Colors.END}")
+                print(analysis.content)
+                print(f"{Colors.CYAN}=================={Colors.END}\n")
+            except Exception as e:
+                print(f"{Colors.RED}[!]{Colors.END} Erreur analyse IA: {e}")
+        
+        # Sauvegarde
+        self._save_osint_report(domain, data)
+        return data
+
+    def osint_email(self, email: str) -> Dict:
+        """
+        Investigation email (breaches, réseaux sociaux)
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} Investigation email: {email}")
+        
+        result = {"email": email, "services": [], "risk": "LOW"}
+        
+        # Holehe (vérification 120+ sites)
+        try:
+            cmd = f"holehe {email}"
+            process = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+            
+            services_found = []
+            for line in process.stdout.split('\n'):
+                if '[+]' in line:
+                    service = line.split('[+]')[1].strip()
+                    services_found.append(service)
+                elif '[-]' in line and 'Rate limit' not in line:
+                    pass  # Non trouvé
+            
+            result["services"] = services_found
+            result["risk"] = "HIGH" if len(services_found) > 5 else "MEDIUM" if services_found else "LOW"
+            
+            print(f"{Colors.GREEN}[+]{Colors.END} Trouvé sur {len(services_found)} services")
+            for svc in services_found[:10]:
+                print(f"  - {svc}")
+                
+        except Exception as e:
+            print(f"{Colors.YELLOW}[!]{Colors.END} Holehe: {e}")
+            result["error"] = str(e)
+        
+        return result
+
+    def osint_username(self, username: str) -> Dict:
+        """
+        Recherche username sur plateformes principales
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} Recherche username: {username}")
+        
+        sites = {
+            "github": f"https://github.com/{username}",
+            "twitter": f"https://twitter.com/{username}",
+            "reddit": f"https://reddit.com/user/{username}",
+            "linkedin": f"https://linkedin.com/in/{username}"
+        }
+        
+        found = []
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+        
+        for site, url in sites.items():
+            try:
+                resp = requests.get(url, headers=headers, timeout=10, allow_redirects=False)
+                if resp.status_code == 200:
+                    found.append({"platform": site, "url": url, "exists": True})
+                    print(f"{Colors.GREEN}[+]{Colors.END} {site}: trouvé")
+                else:
+                    print(f"{Colors.RED}[-]{Colors.END} {site}: non trouvé")
+            except Exception:
+                print(f"{Colors.YELLOW}[!]{Colors.END} {site}: timeout")
+        
+        return {
+            "username": username,
+            "profiles": found,
+            "recommendation": "Vérifier manuellement les profils pour fuites d'informations"
+        }
+
+    # =========================================================================
+    # PENTEST MODULE
+    # =========================================================================
+    def run_recon(self, target: str, intensity: str = "normal") -> Dict:
+        """
+        Reconnaissance réseau avec nmap
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} Scan {intensity} sur {target}")
+        
+        # Construction commande selon intensité
+        if intensity == "stealth":
+            cmd = f"nmap -sS -T2 -p- --open --max-retries 2 {target}"
+            print(f"{Colors.YELLOW}[i]{Colors.END} Mode furtif (lent mais discret)")
+        elif intensity == "aggressive":
+            cmd = f"nmap -sC -sV -O -A -T4 {target}"
+            print(f"{Colors.RED}[!]{Colors.END} Mode agressif (bruyant mais complet)")
+        else:  # normal
+            cmd = f"nmap -sV -sC --top-ports 1000 {target}"
+        
+        results = {"target": target, "intensity": intensity}
+        results["nmap"] = self.safe_execute(cmd, timeout=600)
+        
+        if results["nmap"]["returncode"] == 0:
+            print(f"{Colors.GREEN}[+]{Colors.END} Scan terminé, analyse IA en cours...")
+            
+            # Analyse par LLM
+            analysis_prompt = f"""Analyse ce résultat nmap pour {target}. 
+Extraits:
+1. Services détectés avec versions
+2. Système d'exploitation (si détecté)
+3. Ports critiques ouverts (22, 80, 443, 3306, etc.)
+4. Vulnérabilités potentielles basées sur les versions
+5. Recommandations de tests suivants
+
+Résultat brut:
+{results['nmap']['stdout'][:4000]}"""
+
+            try:
+                analysis = self.llm.invoke(analysis_prompt)
+                results["analysis"] = analysis.content
+                print(f"\n{Colors.CYAN}=== ANALYSE IA ==={Colors.END}")
+                print(analysis.content)
+                print(f"{Colors.CYAN}=================={Colors.END}\n")
+            except Exception as e:
+                print(f"{Colors.RED}[!]{Colors.END} Erreur analyse: {e}")
+        else:
+            print(f"{Colors.RED}[-]{Colors.END} Échec scan: {results['nmap'].get('stderr', 'Erreur inconnue')}")
+        
+        return results
+
+    def web_scan(self, url: str) -> Dict:
+        """
+        Scan sécurité web complet
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} Scan web: {url}")
+        results = {"url": url}
+        
+        # WhatWeb (technologies)
+        print(f"{Colors.BLUE}[*]{Colors.END} Détection technologies...")
+        results["whatweb"] = self.safe_execute(f"whatweb -v {url}", timeout=60)
+        
+        # Gobuster (directories)
+        wordlist = "/usr/share/wordlists/dirb/common.txt"
+        if os.path.exists(wordlist):
+            print(f"{Colors.BLUE}[*]{Colors.END} Enumeration répertoires...")
+            results["gobuster"] = self.safe_execute(
+                f"gobuster dir -u {url} -w {wordlist} -t 30 -b 404,403", 
+                timeout=300
+            )
+        else:
+            results["gobuster"] = {"stdout": "Wordlist non trouvée"}
+        
+        # Analyse IA
+        if results["whatweb"]["returncode"] == 0:
+            analysis_prompt = f"""Analyse scan web pour {url}:
+WhatWeb (technologies):
+{results['whatweb']['stdout'][:2000]}
+
+Gobuster (répertoires):
+{results['gobuster'].get('stdout', 'N/A')[:2000]}
+
+Identifie:
+1. Technologies obsolètes ou vulnérables
+2. Répertoires sensibles découverts (admin, backup, config)
+3. Headers de sécurité manquants
+4. Tests complémentaires recommandés"""
+
+            try:
+                analysis = self.llm.invoke(analysis_prompt)
+                results["analysis"] = analysis.content
+                print(f"\n{Colors.CYAN}=== ANALYSE WEB ==={Colors.END}")
+                print(analysis.content)
+                print(f"{Colors.CYAN}==================={Colors.END}\n")
+            except Exception as e:
+                print(f"{Colors.RED}[!]{Colors.END} Erreur analyse: {e}")
+        
+        return results
+
+    def privesc_check(self) -> str:
+        """
+        Vérification élévation de privilèges locale (Linux)
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} Analyse privilèges locaux...")
+        
+        checks = {
+            "suid_binaries": "find / -perm -4000 -type f 2>/dev/null | head -20",
+            "sudo_rights": "sudo -l 2>/dev/null",
+            "kernel_version": "uname -a",
+            "docker_group": "id | grep docker",
+            "writable_path": "echo $PATH | tr ':' '\\n' | xargs -I {} sh -c 'ls -ld {} 2>/dev/null | grep -E \"^d.*w.\"' 2>/dev/null",
+            "cron_jobs": "find /etc/cron* -type f -perm -o+r 2>/dev/null | head -10"
+        }
+        
+        results = {}
+        for name, cmd in checks.items():
+            print(f"{Colors.BLUE}[*]{Colors.END} Check: {name}")
+            results[name] = self.safe_execute(cmd, sandbox=False)
+        
+        # Analyse IA
+        analysis_prompt = f"""Analyse privesc Linux. Résultats:
+{json.dumps(results, indent=2)}
+
+Identifie:
+1. Vecteurs d'escalade possibles (SUID, Sudo, Docker, etc.)
+2. Kernel exploits applicables si version obsolète
+3. Configurations dangereuses
+4. Exploitation recommandée par ordre de priorité
+
+Réponds en français avec criticité (Critical/High/Medium/Low)."""
+
+        try:
+            return self.llm.invoke(analysis_prompt).content
+        except Exception as e:
+            return f"Erreur analyse: {e}"
+
+    # =========================================================================
+    # FORENSICS MODULE
+    # =========================================================================
+    def analyze_logs(self, log_path: str, log_type: str = "auto") -> str:
+        """
+        Analyse de logs pour investigation
+        """
+        if not os.path.exists(log_path):
+            return f"{Colors.RED}[!]{Colors.END} Fichier {log_path} introuvable"
+        
+        print(f"{Colors.CYAN}[*]{Colors.END} Analyse logs: {log_path}")
+        
+        # Détection auto type
+        if log_type == "auto":
+            if "auth" in log_path.lower():
+                log_type = "auth"
+            elif "access" in log_path.lower() or "http" in log_path:
+                log_type = "web"
+            elif "syslog" in log_path:
+                log_type = "system"
+            else:
+                log_type = "generic"
+        
+        try:
+            # Lecture sécurisée (limitée)
+            with open(log_path, 'r', errors='ignore') as f:
+                lines = f.readlines()
+                # Prendre les 500 dernières lignes si fichier très grand
+                if len(lines) > 500:
+                    lines = lines[-500:]
+                logs = ''.join(lines)
+            
+            print(f"{Colors.BLUE}[*]{Colors.END} {len(lines)} lignes analysées")
+            
+            prompt = f"""Tu es analyste forensics senior. Analyse ces logs {log_type}.
+
+INSTRUCTIONS:
+1. Crée une timeline des événements suspects
+2. Identifie les types d'attaques (brute force, injection, port scan)
+3. Liste les IPs/sources suspectes avec niveau de confiance
+4. Corrèle les événements (ex: fail auth → succès → commande suspicious)
+5. Recommande les prochaines étapes d'investigation et préservation des preuves
+
+LOGS:
+{logs[:4000]}"""
+
+            analysis = self.llm.invoke([HumanMessage(content=prompt)])
+            return analysis.content
+            
+        except Exception as e:
+            return f"{Colors.RED}[!]{Colors.END} Erreur lecture: {e}"
+
+    def memory_analysis_helper(self, dump_path: str) -> str:
+        """
+        Helper analyse mémoire (Volatility3)
+        Note: Nécessite le dump mémoire en paramètre
+        """
+        if not os.path.exists(dump_path):
+            return f"{Colors.RED}[!]{Colors.END} Dump mémoire {dump_path} introuvable"
+        
+        print(f"{Colors.CYAN}[*]{Colors.END} Préparation analyse mémoire: {dump_path}")
+        
+        # Liste processus
+        pslist = self.safe_execute(f"volatility3 -f {dump_path} linux.pslist 2>/dev/null || volatility3 -f {dump_path} windows.pslist", timeout=120)
+        
+        # Network connections
+        netscan = self.safe_execute(f"volatility3 -f {dump_path} linux.netstat 2>/dev/null || volatility3 -f {dump_path} windows.netscan", timeout=120)
+        
+        analysis_prompt = f"""Analyse forensics mémoire:
+Processus:
+{pslist['stdout'][:2000]}
+
+Réseau:
+{netscan['stdout'][:2000]}
+
+Identifie:
+1. Processus suspects (noms usuels, parents anormaux, injection)
+2. Connexions réseaux malveillantes (C2 suspectes)
+3. Anomalies mémoire à creuser
+4. Recommandations artefacts à extraire"""
+
+        try:
+            return self.llm.invoke(analysis_prompt).content
+        except Exception as e:
+            return f"Erreur: {e}"
+
+    # =========================================================================
+    # HARDENING MODULE
+    # =========================================================================
+    def ssh_audit(self, target: str = "localhost") -> str:
+        """
+        Audit configuration SSH
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} Audit SSH sur {target}")
+        
+        # ssh-audit si disponible, sinon config parsing
+        result = self.safe_execute(f"ssh-audit {target} 2>/dev/null || cat /etc/ssh/sshd_config", timeout=30)
+        
+        prompt = f"""Analyse configuration SSH:
+{result['stdout']}
+
+Identifie:
+1. Algorithmes obsolètes (rsa-sha1, diffie-hellman-group1-sha1, etc.)
+2. Configuration durcie recommandée (ANSSI/CIS)
+3. Génère un sshd_config sécurisé avec:
+   - Ciphers modernes (chacha20-poly1305@openssh.com, aes256-gcm@openssh.com)
+   - MACs sécurisés
+   - KexAlgorithms curve25519-sha256
+   - Désactivation root login
+   - Authentication pubkey uniquement recommandée"""
+
+        try:
+            return self.llm.invoke(prompt).content
+        except Exception as e:
+            return f"Erreur: {e}"
+
+    def docker_security_audit(self) -> str:
+        """
+        Audit sécurité conteneurs Docker
+        """
+        print(f"{Colors.CYAN}[*]{Colors.END} Audit Docker...")
+        
+        checks = {
+            "images": "docker images --format '{{.Repository}}:{{.Tag}}'",
+            "containers": "docker ps -a",
+            "root_containers": "docker ps -a --format '{{.Names}}' | xargs -I {} docker inspect --format '{{.Name}}: {{.Config.User}}' {}",
+            "socket": "ls -la /var/run/docker.sock"
+        }
+        
+        results = {k: self.safe_execute(v, sandbox=False) for k, v in checks.items()}
+        
+        prompt = f"""Analyse sécurité Docker:
+{json.dumps(results, indent=2)}
+
+Identifie:
+1. Conteneurs tournant en root (risque évasion)
+2. Images obsolètes ou non sécurisées
+3. Configuration socket Docker
+4. Recommandations hardening (user namespaces, capabilities drop, read-only root fs)"""
+
+        try:
+            return self.llm.invoke(prompt).content
+        except Exception as e:
+            return f"Erreur: {e}"
+
+    # =========================================================================
+    # UTILITAIRES
+    # =========================================================================
+    def _save_osint_report(self, target: str, data: Dict):
+        """Sauvegarde rapport OSINT"""
+        try:
+            filename = f"osint_{target}_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+            filepath = os.path.join(os.path.expanduser("~/cyber-agent/exports"), filename)
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            with open(filepath, 'w') as f:
+                json.dump(data, f, indent=2, default=str)
+            print(f"{Colors.GREEN}[+]{Colors.END} Rapport sauvegardé: {filepath}")
+        except Exception as e:
+            print(f"{Colors.YELLOW}[!]{Colors.END} Erreur sauvegarde: {e}")
+
+    def chat(self, message: str) -> str:
+        """
+        Mode chat libre avec le LLM
+        """
+        return self.llm.invoke(message).content
+
+    def start_mission(self, mission_type: str, target: str) -> MissionContext:
+        """Démarre une nouvelle mission"""
+        mission = MissionContext(target=target, mission_type=mission_type)
+        self.missions.append(mission)
+        self.current_mission = mission
+        print(f"{Colors.GREEN}[+]{Colors.END} Mission '{mission_type}' démarrée sur {target}")
+        return mission
+
+class CyberShell:
+    """
+    Interface interactive complète
+    """
+    def __init__(self):
+        self.config = self._load_config()
+        self.agent = SecurityAgent(
+            model_name=self.config.get("model", "qwen2.5:14b"),
+            device_type=self.config.get("device_type", "generic")
+        )
+    
+    def _load_config(self) -> Dict:
+        """Charge configuration depuis fichier"""
+        config_path = os.path.expanduser("~/.config/cyber-agent/config.json")
+        defaults = {
+            "model": "qwen2.5:14b",
+            "device_type": "generic",
+            "temperature": 0.1
+        }
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path) as f:
+                    return {**defaults, **json.load(f)}
+            except:
+                return defaults
+        return defaults
+    
+    def banner(self):
+        """Affiche bannière"""
+        print(f"""{Colors.CYAN}
+╔══════════════════════════════════════════════════════════════╗
+║  🔒 CYBER-AGENT LOCAL v2.1 - Mode: {self.config.get("device_type", "generic"):^15}          ║
+║  OSINT | PENTEST | FORENSICS | HARDENING                     ║
+╚══════════════════════════════════════════════════════════════╝{Colors.END}""")
+    
+    def help(self):
+        """Aide commandes"""
+        print(f"""
+{Colors.GREEN}OSINT - Renseignement:{Colors.END}
+  osint domain <domain>           → Reconnaissance domaine complète
+  osint email <email>             → Investigation email (breaches)
+  osint user <username>           → Recherche username multi-plateformes
+
+{Colors.GREEN}PENTEST - Offensif:{Colors.END}
+  recon <target>                  → Scan nmap (demande intensité)
+  web <url>                       → Scan web (whatweb + gobuster)
+  privesc                         → Check élévation privilèges locaux
+
+{Colors.GREEN}FORENSICS - Investigation:{Colors.END}
+  logs <fichier> [type]           → Analyse logs (auto/auth/web/system)
+  memory <dump.mem>               → Helper analyse mémoire Volatility3
+
+{Colors.GREEN}HARDENING - Sécurisation:{Colors.END}
+  ssh [target]                    → Audit configuration SSH
+  docker                          → Audit sécurité conteneurs Docker
+
+{Colors.GREEN}Général:{Colors.END}
+  chat <message>                  → Mode expert libre (questions, analyse)
+  mission <type> <target>         → Démarrer mission structurée
+  help                            → Afficher cette aide
+  quit/exit                       → Quitter
+""")
+
+    def run(self):
+        """Boucle principale"""
+        self.banner()
+        self.help()
+        
+        while True:
+            try:
+                user_input = input(f"\n{Colors.MAGENTA}[CyberAgent]{Colors.END} > ").strip()
+                if not user_input:
+                    continue
+                
+                parts = user_input.split()
+                cmd = parts[0].lower()
+                args = parts[1:]
+                
+                # Dispatch commandes
+                if cmd in ["quit", "exit"]:
+                    print(f"{Colors.YELLOW}[*]{Colors.END} Au revoir!")
+                    break
+                
+                elif cmd == "help":
+                    self.help()
+                
+                # OSINT
+                elif cmd == "osint":
+                    if len(args) < 2:
+                        print(f"{Colors.RED}[!]{Colors.END} Usage: osint <domain|email|user> <cible>")
+                        continue
+                    
+                    subcmd, target = args[0], args[1]
+                    
+                    if subcmd == "domain":
+                        self.agent.osint_domain(target)
+                    elif subcmd == "email":
+                        result = self.agent.osint_email(target)
+                        print(f"Exposition: {result.get('risk', 'N/A')}")
+                    elif subcmd in ["user", "username"]:
+                        result = self.agent.osint_username(target)
+                        print(f"Profils trouvés: {len(result.get('profiles', []))}")
+                    else:
+                        print(f"{Colors.RED}[!]{Colors.END} Sous-commande inconnue: {subcmd}")
+                
+                # PENTEST
+                elif cmd == "recon":
+                    if not args:
+                        print(f"{Colors.RED}[!]{Colors.END} Usage: recon <target>")
+                        continue
+                    intensity = input("Intensité [normal/stealth/aggressive]: ").strip() or "normal"
+                    self.agent.run_recon(args[0], intensity)
+                
+                elif cmd == "web":
+                    if not args:
+                        print(f"{Colors.RED}[!]{Colors.END} Usage: web <url>")
+                        continue
+                    self.agent.web_scan(args[0])
+                
+                elif cmd == "privesc":
+                    print(self.agent.privesc_check())
+                
+                # FORENSICS
+                elif cmd == "logs":
+                    if not args:
+                        print(f"{Colors.RED}[!]{Colors.END} Usage: logs <fichier> [type]")
+                        continue
+                    log_type = args[1] if len(args) > 1 else "auto"
+                    print(self.agent.analyze_logs(args[0], log_type))
+                
+                elif cmd == "memory":
+                    if not args:
+                        print(f"{Colors.RED}[!]{Colors.END} Usage: memory <chemin_dump>")
+                        continue
+                    # CORRECTION ICI : Appel correct de la méthode
+                    print(self.agent.memory_analysis_helper(args[0]))
+                
+                # HARDENING
+                elif cmd == "ssh":
+                    target = args[0] if args else "localhost"
+                    print(self.agent.ssh_audit(target))
+                
+                elif cmd == "docker":
+                    print(self.agent.docker_security_audit())
+                
+                # MISSION
+                elif cmd == "mission":
+                    if len(args) < 2:
+                        print(f"{Colors.RED}[!]{Colors.END} Usage: mission <type> <target>")
+                        continue
+                    self.agent.start_mission(args[0], args[1])
+                
+                # CHAT LIBRE
+                elif cmd == "chat":
+                    if not args:
+                        print(f"{Colors.RED}[!]{Colors.END} Usage: chat <message>")
+                        continue
+                    response = self.agent.chat(" ".join(args))
+                    print(f"\n{Colors.CYAN}AI>{Colors.END} {response}\n")
+                
+                else:
+                    # Si commande inconnue, traiter comme chat direct
+                    try:
+                        response = self.agent.chat(user_input)
+                        print(f"\n{Colors.CYAN}AI>{Colors.END} {response}\n")
+                    except Exception as e:
+                        print(f"{Colors.RED}[!]{Colors.END} Commande invalide. Tapez 'help'")
+            
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}[!]{Colors.END} Ctrl+C - Tapez 'quit' pour sortir")
+            except Exception as e:
+                print(f"{Colors.RED}[ERROR]{Colors.END} {e}")
+
+def main():
+    """Point d'entrée"""
+    try:
+        shell = CyberShell()
+        shell.run()
+    except KeyboardInterrupt:
+        print("\n[*] Interrompu")
+        sys.exit(0)
+    except Exception as e:
+        print(f"{Colors.RED}[FATAL]{Colors.END} {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
