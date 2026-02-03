@@ -21,7 +21,6 @@ chmod +x install_cyberagent.sh
 ## 📖 Documentation
 - [Manuel de l'Agent](DOCS/AGENT.md)
 - [Base de Connaissances (RAG)](DOCS/RAG.md)
-- [Guide GitHub](DOCS/GITHUB_GUIDE.md)
 
 ## 📊 Benchmark
 Un outil de benchmark est inclus pour tester si votre matériel est suffisant pour faire tourner l'agent confortablement :
